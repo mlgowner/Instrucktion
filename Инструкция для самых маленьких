@@ -1,0 +1,280 @@
+Вот пошаговая инструкция (cheat sheet) для выполнения задания на базе ОС Astra Linux.
+В инструкции используются стандартные для экзаменов утилиты (iproute2, /etc/network/interfaces, iptables, isc-dhcp-server, bind9, frr или quagga).
+
+Важно: Имена интерфейсов (eth0, eth1 и т.д.) могут отличаться в вашей виртуальной среде. Проверяйте их командой ip link.
+
+---
+
+### 1. Расчет IP-адресации (для справки)
+*Используем частные сети (RFC1918) согласно заданию.*
+
+*   ISP - HQ-RTR: 172.16.1.0/28 (ISP: .1, HQ: .2)
+*   ISP - BR-RTR: 172.16.2.0/28 (ISP: .1, BR: .2)
+*   HQ-SRV (VLAN 100): 10.100.0.0/27 (GW: .1, SRV: .10)
+*   HQ-CLI (VLAN 200): 10.200.0.0/28 (GW: .1)
+*   MGMT (VLAN 999): 10.99.0.0/29 (GW: .1)
+*   BR-SRV LAN: 10.30.0.0/28 (GW: .1, SRV: .10)
+*   Tunnel GRE: 10.0.0.0/30 (HQ: .1, BR: .2)
+
+---
+
+### 2. Настройка имен устройств (Hostname)
+*Выполнять на каждом устройстве соответственно.*
+
+# На HQ-RTR
+hostnamectl set-hostname HQ-RTR
+# На BR-RTR
+hostnamectl set-hostname BR-RTR
+# На HQ-SRV
+hostnamectl set-hostname HQ-SRV
+# На ISP
+hostnamectl set-hostname ISP
+# Применить без перезагрузки
+systemctl restart systemd-hostnamed
+bash
+
+---
+
+### 3. Настройка ISP (Интернет-провайдер)
+
+3.1. Настройка интерфейсов
+Файл: /etc/network/interfaces
+
+auto lo
+iface lo inet loopback
+
+# Интернет (от магистрального провайдера - по заданию DHCP)
+auto eth0
+iface eth0 inet dhcp
+
+# В сторону HQ-RTR
+auto eth1
+iface eth1 inet static
+    address 172.16.1.1
+    netmask 255.255.255.240
+
+# В сторону BR-RTR
+auto eth2
+iface eth2 inet static
+    address 172.16.2.1
+    netmask 255.255.255.240
+*Применить:* systemctl restart networking
+
+3.2. NAT (Masquerade) на ISP
+# Включаем форвардинг
+sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+# Настройка NAT для доступа офисов в интернет
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables-save > /etc/iptables.rules
+
+---
+
+### 4. Настройка HQ-RTR (Главный офис)
+
+4.1. Настройка интерфейсов и VLAN
+Файл: /etc/network/interfaces
+
+auto lo
+iface lo inet loopback
+
+# WAN (в сторону ISP)
+auto eth0
+iface eth0 inet static
+    address 172.16.1.2
+    netmask 255.255.255.240
+    gateway 172.16.1.1
+
+# LAN (физический порт смотрит в коммутатор, настраиваем саб-интерфейсы)
+auto eth1
+iface eth1 inet manual
+
+# VLAN 100 (HQ-SRV)
+auto eth1.100
+iface eth1.100 inet static
+    address 10.100.0.1
+    netmask 255.255.255.224
+    vlan-raw-device eth1
+
+# VLAN 200 (HQ-CLI)
+auto eth1.200
+iface eth1.200 inet static
+    address 10.200.0.1
+    netmask 255.255.255.240
+    vlan-raw-device eth1
+
+# VLAN 999 (MGMT)
+auto eth1.999
+iface eth1.999 inet static
+    address 10.99.0.1
+    netmask 255.255.255.248
+    vlan-raw-device eth1
+*Применить:* systemctl restart networking
+
+4.2. Пользователи и SSH (Задание 3)
+# Создать пользователя net_admin
+useradd -m -s /bin/bash net_admin
+passwd net_admin # (задать любой пароль, но sudo без пароля)
+
+# Настройка sudo без пароля
+echo "net_admin ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Настройка SSH
+nano /etc/ssh/sshd_config
+# Внести изменения:
+# Port 2026
+# PermitRootLogin no
+# AllowUsers sshuser net_admin (sshuser понадобится позже, если он есть на роутере, но по заданию он на серверах. Если нужно на роутере - создайте).
+# Banner /etc/issue.net
+
+# Создать баннер
+echo "Authorized access only" > /etc/issue.net
+
+systemctl restart ssh
+
+4.3. NAT для локальной сети
+sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+iptables -t nat -A POSTROUTING -o eth0 -s 10.0.0.0/8 -j MASQUERADE
+
+4.4. DHCP Сервер (для HQ-CLI)
+Установка: apt install isc-dhcp-server
+Файл: /etc/default/isc-dhcp-server -> INTERFACESv4="eth1.200"
+
+Файл: /etc/dhcp/dhcpd.conf
+option domain-name "au-team.ipro";
+option domain-name-servers 10.100.0.10; # IP адрес HQ-SRV
+
+subnet 10.200.0.0 netmask 255.255.255.240 {
+  range 10.200.0.2 10.200.0.14;
+  option routers 10.200.0.1;
+}
+*Запуск:* systemctl restart isc-dhcp-server
+
+---
+
+### 5. Настройка BR-RTR (Филиал)
+
+5.1. Интерфейсы
+Файл: /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+# WAN
+auto eth0
+iface eth0 inet static
+    address 172.16.2.2
+    netmask 255.255.255.240
+    gateway 172.16.2.1
+
+# LAN
+auto eth1
+iface eth1 inet static
+    address 10.30.0.1
+    netmask 255.255.255.240
+*Применить:* systemctl restart networking
+*Не забудьте включить форвардинг и NAT (аналогично п. 4.3).*
+
+---
+
+### 6. Туннель и Динамическая маршрутизация (HQ-RTR <-> BR-RTR)
+
+6.1. Настройка GRE туннеля
+
+На HQ-RTR:
+ip tunnel add gre1 mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255
+ip link set gre1 up
+ip addr add 10.0.0.1/30 dev gre1
+
+На BR-RTR:
+ip tunnel add gre1 mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255
+ip link set gre1 up
+ip addr add 10.0.0.2/30 dev gre1
+
+6.2. Динамическая маршрутизация (OSPF)
+*Используем FRR (или Quagga). Если не установлены - apt install frr.*
+*Редактируем /etc/frr/daemons -> ospfd=yes.*
+
+Конфигурация HQ-RTR (`vtysh`):
+conf t
+router ospf
+ network 10.100.0.0/27 area 0
+ network 10.200.0.0/28 area 0
+ network 10.99.0.0/29 area 0
+ network 10.0.0.0/30 area 0
+exit
+int gre1
+ ip ospf mtu-ignore # Важно для GRE
+exit
+wr
+
+Конфигурация BR-RTR (`vtysh`):
+conf t
+router ospf
+ network 10.30.0.0/28 area 0
+ network 10.0.0.0/30 area 0
+exit
+int gre1
+ ip ospf mtu-ignore
+exit
+wr
+
+---
+
+### 7. Настройка HQ-SRV (Сервер)
+
+7.1. Сеть
+Файл: /etc/network/interfaces
+auto eth0
+iface eth0 inet static
+    address 10.100.0.10
+    netmask 255.255.255.224
+    gateway 10.100.0.1
+
+7.2. Пользователь sshuser (Задание 3)
+useradd -m -s /bin/bash sshuser
+echo "sshuser:P@ssw0rd" | chpasswd
+
+7.3. DNS Сервер (Bind9)
+Установка: apt install bind9
+
+Файл: /etc/bind/named.conf.options
+options {
+    directory "/var/cache/bind";
+    recursion yes;
+    allow-query { any; };
+    forwarders {
+        77.88.8.7;
+        77.88.8.3;
+    };
+    dnssec-validation no; # Часто нужно отключать в изолированных лабах
+};
+
+Файл: /etc/bind/named.conf.local
+zone "au-team.ipro" {
+    type master;
+    file "/etc/bind/db.au-team.ipro";
+};
+
+Создать файл зоны: cp /etc/bind/db.local /etc/bind/db.au-team.ipro
+Редактировать /etc/bind/db.au-team.ipro:
+; Заменить localhost на au-team.ipro.
+@       IN      SOA     hq-srv.au-team.ipro. root.au-team.ipro. (
+... )
+@       IN      NS      hq-srv.au-team.ipro.
+@       IN      A       10.100.0.10
+hq-srv  IN      A       10.100.0.10
+web     IN      A       10.100.0.10  ; пример из таблицы 3
+docker  IN      A       10.100.0.10  ; пример из таблицы 3
+*Перезапуск:* systemctl restart bind9
+
+---
+
+### 8. Проверка (Чек-лист)
+
+1.  Ping: С HQ-CLI (получил IP по DHCP?) пингуется 8.8.8.8? (Работает NAT на HQ и ISP).
+2.  Маршрутизация: С HQ-SRV пингуется BR-SRV? (Работает туннель и OSPF).
+3.  SSH: ssh -p 2026 sshuser@10.100.0.10 пускает? root не пускает? Баннер есть?
+4.  DNS: nslookup web.au-team.ipro на клиенте выдает IP?
